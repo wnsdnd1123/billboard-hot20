@@ -190,14 +190,19 @@ jobs:
                                  maxsplit=1, flags=re.I)[0]
               credits = re.split(r'\s+(?:&|with|featuring|feat\.?)\s+', song['artist'], flags=re.I)
               candidates = {}
+              observed = {}
               for query in (f"{song['title']} {song['artist']}", f"{song['title']} {primary}"):
                   for r in api.search(query, filter='songs', limit=10):
+                      if r.get('videoId'):
+                          observed[r['videoId']] = {k: r.get(k) for k in ['videoId', 'title', 'artists', 'album']}
                       artists = ''.join(normalize(a['name']) for a in r.get('artists', []))
                       if (r.get('videoId') and r.get('album')
                               and normalize(r.get('title', '')) == normalize(song['title'])
                               and all(normalize(credit) in artists for credit in credits)):
                           candidates[r['videoId']] = r
               if not candidates:
+                  print('Catalog candidates for ' + song['title'] + ': ' +
+                        json.dumps(list(observed.values())[:10], ensure_ascii=False))
                   raise ValueError(f"No confident catalog match: {song['title']} / {song['artist']}")
               # Require all explicitly credited collaborators if their catalog metadata allows it.
               def score(r):
@@ -323,7 +328,14 @@ jobs:
               playlist_id = resolve_playlist_id(api, playlist_id)
               # Validate the target and resolve every song before the first write.
               read_tracks(api, playlist_id)
-              targets = [select_song(api, s) for s in songs]
+              targets, errors = [], []
+              for song in songs:
+                  try:
+                      targets.append(select_song(api, song))
+                  except ValueError as error:
+                      errors.append(str(error))
+              if errors:
+                  raise ValueError('Unresolved songs; no changes made: ' + '; '.join(errors))
               Path('run').mkdir(exist_ok=True)
               Path('run/plan.json').write_text(json.dumps(
                   {'chart_date': chart_date, 'source': CHART_URL, 'songs': targets},
