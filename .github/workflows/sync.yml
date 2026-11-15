@@ -1,5 +1,8 @@
 name: Billboard Hot 20
 on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/sync.yml']
   schedule:
     - cron: '23 18 * * 2,3'
   workflow_dispatch:
