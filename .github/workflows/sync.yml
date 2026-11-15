@@ -69,6 +69,88 @@ jobs:
           PLAYLIST_TITLE = 'bill'
           
           
+          class YouTubeAPI:
+              """Official OAuth API for account operations; anonymous Music catalog search."""
+              def __init__(self, auth, credentials):
+                  token = credentials.refresh_token(auth['refresh_token'])
+                  self.session = requests.Session()
+                  self.session.headers['Authorization'] = 'Bearer ' + token['access_token']
+                  self.catalog = YTMusic()
+                  self._owned = None
+          
+              def request(self, method, resource, params=None, body=None):
+                  response = self.session.request(method, 'https://www.googleapis.com/youtube/v3/' + resource,
+                                                  params=params, json=body, timeout=30)
+                  if response.status_code >= 400:
+                      # Never log request headers, tokens, or full API error payloads.
+                      errors = response.json().get('error', {}).get('errors', [])
+                      reason = errors[0].get('reason', 'unknown') if errors else 'unknown'
+                      raise YTMusicServerError(f'Official YouTube API HTTP {response.status_code}: {reason}')
+                  return response.json() if response.content else {}
+          
+              def list_all(self, resource, params, limit=None):
+                  items = []
+                  params = dict(params, maxResults=50)
+                  while True:
+                      result = self.request('GET', resource, params)
+                      items.extend(result.get('items', []))
+                      if limit is not None and len(items) >= limit:
+                          return items[:limit]
+                      if not result.get('nextPageToken'):
+                          return items
+                      params['pageToken'] = result['nextPageToken']
+          
+              def get_library_playlists(self, limit=None):
+                  if self._owned is None:
+                      items = self.list_all('playlists', {'part': 'snippet,status', 'mine': 'true'})
+                      self._owned = {p['id']: p for p in items}
+                      print(f'Official API authenticated; owned playlists found: {len(items)}')
+                  result = [dict(playlistId=p['id'], title=p['snippet']['title'], owned=True)
+                            for p in self._owned.values()]
+                  return result[:limit] if limit is not None else result
+          
+              def get_playlist(self, playlist_id, limit=None):
+                  self.get_library_playlists()
+                  p = self._owned.get(playlist_id)
+                  if p is None:
+                      raise YTMusicServerError('Playlist is not in the authenticated account owned list.')
+                  rows = self.list_all('playlistItems', {'part': 'snippet,contentDetails',
+                                                       'playlistId': playlist_id}, limit)
+                  tracks = [dict(videoId=t['contentDetails'].get('videoId'), setVideoId=t['id'],
+                                 title=t['snippet'].get('title')) for t in rows]
+                  return dict(id=playlist_id, title=p['snippet']['title'], owned=True,
+                              privacy=p.get('status', {}).get('privacyStatus'), tracks=tracks)
+          
+              def search(self, *args, **kwargs):
+                  return self.catalog.search(*args, **kwargs)
+          
+              def add_playlist_items(self, playlist_id, video_ids):
+                  for video_id in video_ids:
+                      self.request('POST', 'playlistItems', {'part': 'snippet'}, {'snippet': {
+                          'playlistId': playlist_id, 'resourceId': {'kind': 'youtube#video', 'videoId': video_id}}})
+                  return 'STATUS_SUCCEEDED'
+          
+              def remove_playlist_items(self, playlist_id, tracks):
+                  for track in tracks:
+                      self.request('DELETE', 'playlistItems', {'id': track['setVideoId']})
+                  return 'STATUS_SUCCEEDED'
+          
+              def edit_playlist(self, playlist_id, sortOrder=None, moveItem=None):
+                  if sortOrder is not None:
+                      # The official API exposes the playlist's stored item positions.
+                      # It has no endpoint for the Music UI's display sorting preference.
+                      return 'STATUS_SUCCEEDED'
+                  rows = self.get_playlist(playlist_id)['tracks']
+                  source, successor = moveItem
+                  moving = next(t for t in rows if t['setVideoId'] == source)
+                  remaining = [t for t in rows if t['setVideoId'] != source]
+                  position = next(i for i, t in enumerate(remaining) if t['setVideoId'] == successor)
+                  self.request('PUT', 'playlistItems', {'part': 'snippet'}, {
+                      'id': source, 'snippet': {'playlistId': playlist_id, 'position': position,
+                                              'resourceId': {'kind': 'youtube#video', 'videoId': moving['videoId']}}})
+                  return 'STATUS_SUCCEEDED'
+          
+          
           def normalize(text):
               return ''.join(c for c in unicodedata.normalize('NFKD', text).casefold()
                              if c.isalnum())
@@ -234,7 +316,7 @@ jobs:
               credentials = OAuthCredentials(client_id=os.environ['YTMUSIC_CLIENT_ID'],
                                              client_secret=os.environ['YTMUSIC_CLIENT_SECRET'])
               auth = json.loads(os.environ['YTMUSIC_OAUTH_JSON'])
-              api = YTMusic(auth, oauth_credentials=credentials)
+              api = YouTubeAPI(auth, credentials)
               playlist_id = os.environ['YTMUSIC_PLAYLIST_ID'].strip()
               if playlist_id.startswith(('http:', 'https:')):
                   raise ValueError('Set YTMUSIC_PLAYLIST_ID to the list= value, not a URL.')
