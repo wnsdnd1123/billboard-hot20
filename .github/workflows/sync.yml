@@ -139,7 +139,7 @@ jobs:
                       self.request('DELETE', 'playlistItems', {'id': track['setVideoId']})
                   return 'STATUS_SUCCEEDED'
           
-              def edit_playlist(self, playlist_id, sortOrder=None, moveItem=None):
+              def edit_playlist(self, playlist_id, sortOrder=None, moveItem=None, position=None):
                   if sortOrder is not None:
                       # The official API exposes the playlist's stored item positions.
                       # It has no endpoint for the Music UI's display sorting preference.
@@ -147,8 +147,9 @@ jobs:
                   rows = self.get_playlist(playlist_id)['tracks']
                   source, successor = moveItem
                   moving = next(t for t in rows if t['setVideoId'] == source)
-                  remaining = [t for t in rows if t['setVideoId'] != source]
-                  position = next(i for i, t in enumerate(remaining) if t['setVideoId'] == successor)
+                  if position is None:
+                      remaining = [t for t in rows if t['setVideoId'] != source]
+                      position = next(i for i, t in enumerate(remaining) if t['setVideoId'] == successor)
                   self.request('PUT', 'playlistItems', {'part': 'snippet'}, {
                       'id': source, 'snippet': {'playlistId': playlist_id, 'position': position,
                                               'resourceId': {'kind': 'youtube#video', 'videoId': moving['videoId']}}})
@@ -310,17 +311,30 @@ jobs:
               require_success(api.edit_playlist(playlist_id, sortOrder=PlaylistSortOrder.MANUAL))
               _, tracks = read_tracks(api, playlist_id)
               if len(tracks) != 20 or {t['videoId'] for t in tracks} != set(desired):
-                  raise RuntimeError('Membership verification failed before reordering.')
+                  for delay in (2, 4, 8, 16):
+                      time.sleep(delay)
+                      _, tracks = read_tracks(api, playlist_id)
+                      if len(tracks) == 20 and {t['videoId'] for t in tracks} == set(desired):
+                          break
+                  else:
+                      raise RuntimeError('Membership verification failed before reordering.')
               # Move each desired entry before the current entry at that index.
               for i, video_id in enumerate(desired):
                   j = next(k for k, t in enumerate(tracks) if t['videoId'] == video_id)
                   if j != i:
                       require_success(api.edit_playlist(playlist_id, moveItem=(
-                          tracks[j]['setVideoId'], tracks[i]['setVideoId'])))
+                          tracks[j]['setVideoId'], tracks[i]['setVideoId']), position=i))
                       tracks.insert(i, tracks.pop(j))
               final, tracks = read_tracks(api, playlist_id)
               if [t['videoId'] for t in tracks] != desired:
-                  raise RuntimeError('Final ranking verification failed; see backup and run plan.')
+                  for delay in (2, 4, 8, 16):
+                      time.sleep(delay)
+                      final, tracks = read_tracks(api, playlist_id)
+                      if [t['videoId'] for t in tracks] == desired:
+                          break
+                  else:
+                      print('Observed ranking: ' + json.dumps([t['videoId'] for t in tracks]))
+                      raise RuntimeError('Final ranking verification failed; see backup and run plan.')
               Path('run/after.json').write_text(json.dumps(final, ensure_ascii=False, indent=2))
               print('Verified: 20 songs in Billboard rank order.')
           
