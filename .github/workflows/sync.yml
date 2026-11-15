@@ -186,9 +186,9 @@ jobs:
           
           def select_song(api, song):
               # Catalog songs with albums are preferred over user-uploaded videos.
-              primary = re.split(r'\s+(?:&|with|featuring|feat\.?)\s+', song['artist'],
+              primary = re.split(r'\s+(?:&|and|with|featuring|feat\.?)\s+', song['artist'],
                                  maxsplit=1, flags=re.I)[0]
-              credits = re.split(r'\s+(?:&|with|featuring|feat\.?)\s+', song['artist'], flags=re.I)
+              credits = re.split(r'\s+(?:&|and|with|featuring|feat\.?)\s+', song['artist'], flags=re.I)
               candidates = {}
               observed = {}
               for query in (f"{song['title']} {song['artist']}", f"{song['title']} {primary}"):
@@ -196,9 +196,15 @@ jobs:
                       if r.get('videoId'):
                           observed[r['videoId']] = {k: r.get(k) for k in ['videoId', 'title', 'artists', 'album']}
                       artists = ''.join(normalize(a['name']) for a in r.get('artists', []))
+                      title = r.get('title', '')
+                      featuring = re.search(r'\s*[\(\[]\s*(?:feat(?:uring)?\.?|with)\s+([^\)\]]+)[\)\]]\s*$',
+                                            title, flags=re.I)
+                      title_base = title[:featuring.start()] if featuring else title
+                      credited_artists = artists + (normalize(featuring.group(1)) if featuring else '')
                       if (r.get('videoId') and r.get('album')
-                              and normalize(r.get('title', '')) == normalize(song['title'])
-                              and all(normalize(credit) in artists for credit in credits)):
+                              and normalize(title_base) == normalize(song['title'])
+                              and normalize(primary) in artists
+                              and all(normalize(credit) in credited_artists for credit in credits)):
                           candidates[r['videoId']] = r
               if not candidates:
                   print('Catalog candidates for ' + song['title'] + ': ' +
