@@ -57,6 +57,7 @@ jobs:
           import os
           from pathlib import Path
           import re
+          import time
           import unicodedata
           
           from bs4 import BeautifulSoup
@@ -126,8 +127,11 @@ jobs:
           
               def add_playlist_items(self, playlist_id, video_ids):
                   for video_id in video_ids:
-                      self.request('POST', 'playlistItems', {'part': 'snippet'}, {'snippet': {
+                      added = self.request('POST', 'playlistItems', {'part': 'snippet'}, {'snippet': {
                           'playlistId': playlist_id, 'resourceId': {'kind': 'youtube#video', 'videoId': video_id}}})
+                      if not added.get('id') or added.get('snippet', {}).get('resourceId', {}).get('videoId') != video_id:
+                          raise RuntimeError('Official API did not confirm the requested recording was added.')
+                  print(f'Official API confirmed {len(video_ids)} added recordings.')
                   return 'STATUS_SUCCEEDED'
           
               def remove_playlist_items(self, playlist_id, tracks):
@@ -285,7 +289,16 @@ jobs:
                   require_success(api.add_playlist_items(playlist_id, missing))
               _, tracks = read_tracks(api, playlist_id)
               if not set(desired).issubset({t['videoId'] for t in tracks}):
-                  raise RuntimeError('Some additions are missing; stopped before deleting anything.')
+                  # Playlist reads can lag accepted writes. Never repeat inserts while waiting.
+                  for delay in (2, 4, 8):
+                      time.sleep(delay)
+                      _, tracks = read_tracks(api, playlist_id)
+                      if set(desired).issubset({t['videoId'] for t in tracks}):
+                          break
+                  else:
+                      missing_after = sorted(set(desired) - {t['videoId'] for t in tracks})
+                      print(f'Items visible after inserts: {len(tracks)}; missing recording IDs: {missing_after}')
+                      raise RuntimeError('Some additions are missing; stopped before deleting anything.')
               seen, remove = set(), []
               for track in tracks:
                   v = track['videoId']
