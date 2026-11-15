@@ -46,7 +46,7 @@ jobs:
       - name: Synchronize playlist
         if: steps.setup.outputs.ready == 'true'
         env:
-          APPLY: ${{ github.event_name == 'schedule' || inputs.apply }}
+          APPLY: ${{ github.event_name == 'schedule' || inputs.apply || github.event.head_commit.message == 'Apply current Billboard Hot 20' }}
         shell: bash
         run: |
           cat > /tmp/sync.py <<'PYTHON_SCRIPT'
