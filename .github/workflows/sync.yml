@@ -60,9 +60,10 @@ jobs:
           import requests
           from ytmusicapi import OAuthCredentials, YTMusic
           from ytmusicapi.models.content.enums import PlaylistSortOrder
+          from ytmusicapi.exceptions import YTMusicServerError
           
           CHART_URL = 'https://ca.billboard.com/charts/hot-100/'
-          PLAYLIST_TITLE = 'Billboard Hot 20'
+          PLAYLIST_TITLE = 'bill'
           
           
           def normalize(text):
@@ -131,10 +132,37 @@ jobs:
                   raise RuntimeError('YouTube Music did not confirm the playlist edit.')
           
           
+          def resolve_playlist_id(api, configured_id):
+              """Validate the supplied link; recover only a single owned title match."""
+              try:
+                  playlist = api.get_playlist(configured_id, limit=1)
+              except YTMusicServerError:
+                  print('The supplied playlist ID could not be loaded; checking your library.')
+              else:
+                  if playlist.get('title') == PLAYLIST_TITLE and playlist.get('owned') is True:
+                      return playlist.get('id') or configured_id
+                  print('The supplied playlist does not identify an owned bill playlist.')
+              # This authenticated lookup also distinguishes a bad link from account access problems.
+              playlists = api.get_library_playlists(limit=None)
+              matches = [p for p in playlists if p.get('title') == PLAYLIST_TITLE
+                         and p.get('owned') is True and p.get('playlistId')]
+              if not matches:
+                  raise ValueError('No owned bill playlist was found in the authenticated '
+                                   'YouTube Music library. Check the account/channel used for Google '
+                                   'authorization and the exact playlist title. No changes made.')
+              if len(matches) != 1:
+                  raise ValueError('Multiple owned bill playlists found. '
+                                   'A unique target is required. No changes made.')
+              print('Found one owned bill playlist in your library.')
+              return matches[0]['playlistId']
+          
+          
           def read_tracks(api, playlist_id):
               playlist = api.get_playlist(playlist_id, limit=None)
               if playlist.get('title') != PLAYLIST_TITLE:
                   raise ValueError(f'Playlist must be named exactly {PLAYLIST_TITLE!r}.')
+              if playlist.get('owned') is not True:
+                  raise ValueError('The authenticated account does not own this playlist. No changes made.')
               tracks = playlist.get('tracks', [])
               if any(not t.get('videoId') or not t.get('setVideoId') for t in tracks):
                   raise ValueError('Playlist contains unavailable or uneditable items; inspect it first.')
@@ -207,6 +235,7 @@ jobs:
               playlist_id = os.environ['YTMUSIC_PLAYLIST_ID'].strip()
               if playlist_id.startswith(('http:', 'https:')):
                   raise ValueError('Set YTMUSIC_PLAYLIST_ID to the list= value, not a URL.')
+              playlist_id = resolve_playlist_id(api, playlist_id)
               # Validate the target and resolve every song before the first write.
               read_tracks(api, playlist_id)
               targets = [select_song(api, s) for s in songs]
