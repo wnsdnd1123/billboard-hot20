@@ -1,0 +1,236 @@
+name: Billboard Hot 20
+on:
+  schedule:
+    - cron: '23 18 * * 2,3'
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: 'Apply playlist changes'
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: billboard-hot20
+  cancel-in-progress: false
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      YTMUSIC_OAUTH_JSON: ${{ secrets.YTMUSIC_OAUTH_JSON }}
+      YTMUSIC_CLIENT_ID: ${{ secrets.YTMUSIC_CLIENT_ID }}
+      YTMUSIC_CLIENT_SECRET: ${{ secrets.YTMUSIC_CLIENT_SECRET }}
+      YTMUSIC_PLAYLIST_ID: PLJgaux4Z44qk
+    steps:
+      - name: Check account setup
+        id: setup
+        shell: bash
+        run: |
+          if [ -n "$YTMUSIC_OAUTH_JSON" ] && [ -n "$YTMUSIC_CLIENT_ID" ] && [ -n "$YTMUSIC_CLIENT_SECRET" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "Google authorization is not configured yet. No playlist changes made." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/setup-python@v5
+        if: steps.setup.outputs.ready == 'true'
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        if: steps.setup.outputs.ready == 'true'
+        run: pip install ytmusicapi==1.12.3 beautifulsoup4==4.14.3
+      - name: Synchronize playlist
+        if: steps.setup.outputs.ready == 'true'
+        env:
+          APPLY: ${{ github.event_name == 'schedule' || inputs.apply }}
+        shell: bash
+        run: |
+          cat > /tmp/sync.py <<'PYTHON_SCRIPT'
+          """Reconcile an existing YouTube Music playlist with the current US Hot 100."""
+          import argparse
+          from datetime import date, datetime, timezone
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import unicodedata
+          
+          from bs4 import BeautifulSoup
+          import requests
+          from ytmusicapi import OAuthCredentials, YTMusic
+          from ytmusicapi.models.content.enums import PlaylistSortOrder
+          
+          CHART_URL = 'https://ca.billboard.com/charts/hot-100/'
+          PLAYLIST_TITLE = 'Billboard Hot 20'
+          
+          
+          def normalize(text):
+              return ''.join(c for c in unicodedata.normalize('NFKD', text).casefold()
+                             if c.isalnum())
+          
+          
+          def parse_chart(html, today=None):
+              soup = BeautifulSoup(html, 'html.parser')
+              node = soup.select_one('.inside-post-body')
+              match = re.search(r'([A-Z][a-z]+ \d{1,2}, \d{4})', node.get_text(' ', strip=True) if node else '')
+              if not match:
+                  raise ValueError('Chart date missing; page format may have changed.')
+              chart_date = datetime.strptime(match[1], '%B %d, %Y').date()
+              age = ((today or datetime.now(timezone.utc).date()) - chart_date).days
+              if not -8 <= age <= 10:
+                  raise ValueError(f'Chart date {chart_date} is stale or unexpectedly in the future.')
+              songs = []
+              for row in soup.select('.chart-item'):
+                  rank = row.select_one('.chart-item-position')
+                  title = row.select_one('.chart-item-headline')
+                  artist = row.select_one('.chart-item-subheadline')
+                  if rank and title and artist and rank.get_text(strip=True).isdigit():
+                      n = int(rank.get_text(strip=True))
+                      if n <= 20:
+                          songs.append(dict(rank=n, title=title.get_text(strip=True),
+                                            artist=artist.get_text(strip=True)))
+              songs.sort(key=lambda x: x['rank'])
+              if [s['rank'] for s in songs] != list(range(1, 21)):
+                  raise ValueError('Expected exactly ranks 1–20; no playlist changes made.')
+              if len({(normalize(s['title']), normalize(s['artist'])) for s in songs}) != 20:
+                  raise ValueError('Duplicate chart entry.')
+              return chart_date.isoformat(), songs
+          
+          
+          def select_song(api, song):
+              # Catalog songs with albums are preferred over user-uploaded videos.
+              primary = re.split(r'\s+(?:&|with|featuring|feat\.?)\s+', song['artist'],
+                                 maxsplit=1, flags=re.I)[0]
+              credits = re.split(r'\s+(?:&|with|featuring|feat\.?)\s+', song['artist'], flags=re.I)
+              candidates = {}
+              for query in (f"{song['title']} {song['artist']}", f"{song['title']} {primary}"):
+                  for r in api.search(query, filter='songs', limit=10):
+                      artists = ''.join(normalize(a['name']) for a in r.get('artists', []))
+                      if (r.get('videoId') and r.get('album')
+                              and normalize(r.get('title', '')) == normalize(song['title'])
+                              and all(normalize(credit) in artists for credit in credits)):
+                          candidates[r['videoId']] = r
+              if not candidates:
+                  raise ValueError(f"No confident catalog match: {song['title']} / {song['artist']}")
+              # Require all explicitly credited collaborators if their catalog metadata allows it.
+              def score(r):
+                  credited = sum(normalize(a['name']) in normalize(song['artist'])
+                                 for a in r.get('artists', []))
+                  official_audio = r.get('videoType') == 'MUSIC_VIDEO_TYPE_ATV'
+                  return official_audio, credited
+              chosen = max(candidates.values(), key=score)
+              return {**song, 'videoId': chosen['videoId'],
+                      'matchedTitle': chosen['title'], 'matchedArtists': chosen['artists'],
+                      'album': chosen['album']}
+          
+          
+          def require_success(result):
+              status = result.get('status') if isinstance(result, dict) else result
+              if status != 'STATUS_SUCCEEDED':
+                  raise RuntimeError('YouTube Music did not confirm the playlist edit.')
+          
+          
+          def read_tracks(api, playlist_id):
+              playlist = api.get_playlist(playlist_id, limit=None)
+              if playlist.get('title') != PLAYLIST_TITLE:
+                  raise ValueError(f'Playlist must be named exactly {PLAYLIST_TITLE!r}.')
+              tracks = playlist.get('tracks', [])
+              if any(not t.get('videoId') or not t.get('setVideoId') for t in tracks):
+                  raise ValueError('Playlist contains unavailable or uneditable items; inspect it first.')
+              return playlist, tracks
+          
+          
+          def reconcile(api, playlist_id, targets, apply=False):
+              desired = [x['videoId'] for x in targets]
+              if len(desired) != 20 or len(set(desired)) != 20:
+                  raise ValueError('Expected 20 distinct resolved recordings.')
+              playlist, tracks = read_tracks(api, playlist_id)
+              Path('run').mkdir(exist_ok=True)
+              Path('run/before.json').write_text(json.dumps(playlist, ensure_ascii=False, indent=2))
+              print(f'Existing items: {len(tracks)}; target items: 20')
+              if not apply:
+                  print('Preview only; no playlist changes made.')
+                  return
+              if [t['videoId'] for t in tracks] == desired:
+                  print('Playlist already matches the chart.')
+                  return
+              # Add and confirm availability before removing old entries.
+              missing = [v for v in desired if v not in {t['videoId'] for t in tracks}]
+              if missing:
+                  require_success(api.add_playlist_items(playlist_id, missing))
+              _, tracks = read_tracks(api, playlist_id)
+              if not set(desired).issubset({t['videoId'] for t in tracks}):
+                  raise RuntimeError('Some additions are missing; stopped before deleting anything.')
+              seen, remove = set(), []
+              for track in tracks:
+                  v = track['videoId']
+                  if v not in desired or v in seen:
+                      remove.append(track)
+                  seen.add(v)
+              if remove:
+                  require_success(api.remove_playlist_items(playlist_id, remove))
+              require_success(api.edit_playlist(playlist_id, sortOrder=PlaylistSortOrder.MANUAL))
+              _, tracks = read_tracks(api, playlist_id)
+              if len(tracks) != 20 or {t['videoId'] for t in tracks} != set(desired):
+                  raise RuntimeError('Membership verification failed before reordering.')
+              # Move each desired entry before the current entry at that index.
+              for i, video_id in enumerate(desired):
+                  j = next(k for k, t in enumerate(tracks) if t['videoId'] == video_id)
+                  if j != i:
+                      require_success(api.edit_playlist(playlist_id, moveItem=(
+                          tracks[j]['setVideoId'], tracks[i]['setVideoId'])))
+                      tracks.insert(i, tracks.pop(j))
+              final, tracks = read_tracks(api, playlist_id)
+              if [t['videoId'] for t in tracks] != desired:
+                  raise RuntimeError('Final ranking verification failed; see backup and run plan.')
+              Path('run/after.json').write_text(json.dumps(final, ensure_ascii=False, indent=2))
+              print('Verified: 20 songs in Billboard rank order.')
+          
+          
+          def main():
+              parser = argparse.ArgumentParser()
+              parser.add_argument('--apply', action='store_true')
+              parser.add_argument('--chart-only', action='store_true')
+              args = parser.parse_args()
+              response = requests.get(CHART_URL, timeout=30)
+              response.raise_for_status()
+              chart_date, songs = parse_chart(response.text)
+              print(f'US Billboard Hot 100: {chart_date}')
+              if args.chart_only:
+                  print(json.dumps(songs, ensure_ascii=False, indent=2))
+                  return
+              credentials = OAuthCredentials(client_id=os.environ['YTMUSIC_CLIENT_ID'],
+                                             client_secret=os.environ['YTMUSIC_CLIENT_SECRET'])
+              auth = json.loads(os.environ['YTMUSIC_OAUTH_JSON'])
+              api = YTMusic(auth, oauth_credentials=credentials)
+              playlist_id = os.environ['YTMUSIC_PLAYLIST_ID'].strip()
+              if playlist_id.startswith(('http:', 'https:')):
+                  raise ValueError('Set YTMUSIC_PLAYLIST_ID to the list= value, not a URL.')
+              # Validate the target and resolve every song before the first write.
+              read_tracks(api, playlist_id)
+              targets = [select_song(api, s) for s in songs]
+              Path('run').mkdir(exist_ok=True)
+              Path('run/plan.json').write_text(json.dumps(
+                  {'chart_date': chart_date, 'source': CHART_URL, 'songs': targets},
+                  ensure_ascii=False, indent=2))
+              for s in targets:
+                  print(f"{s['rank']:2}. {s['title']} — {s['artist']} [{s['videoId']}]")
+              reconcile(api, playlist_id, targets, args.apply)
+          
+          
+          if __name__ == '__main__':
+              main()
+          PYTHON_SCRIPT
+          if [ "$APPLY" = "true" ]; then
+            python /tmp/sync.py --apply
+          else
+            python /tmp/sync.py
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sync-record-${{ github.run_id }}
+          path: run/*.json
+          retention-days: 14
+          if-no-files-found: ignore
